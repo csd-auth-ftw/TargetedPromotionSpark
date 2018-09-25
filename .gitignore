@@ -77,3 +77,4 @@ project/plugins/project/
 
 # custom 
 .idea/*
+/data/

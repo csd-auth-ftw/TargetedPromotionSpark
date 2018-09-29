@@ -109,4 +109,15 @@ object Utils {
 
     new SparseVector(sp.size, sp.indices, sp_vals)
   }
+
+  def divSpVector(sp: SparseVector, value: Double): SparseVector = {
+    val sp_vals = sp.values.map(r => r / value)
+
+    new SparseVector(sp.size, sp.indices, sp_vals)
+  }
+
+  def addArrays(arr1: Array[Double], arr2: Array[Double]): Array[Double] = {
+    arr1.zip(arr2).map { case (x, y) => x + y }
+  }
+
 }

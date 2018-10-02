@@ -77,4 +77,6 @@ project/plugins/project/
 
 # custom 
 .idea/*
-/data/
+data/*
+preprocess/input/*
+preprocess/output/*

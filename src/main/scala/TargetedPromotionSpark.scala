@@ -13,14 +13,14 @@ object TargetedPromotionSpark {
 
 
   val NUMBER_ITERATIONS: Int = 50
-  val K = 1
+  val K = 4
 
   def main(args: Array[String]): Unit = {
 
 
     val transactionsPath = "./data/sales_fact_1997.csv"
-    val productsPath = "./data/chinese_products.csv"
-    val categoriesPath = "./data/chinese_categories.csv"
+    val productsPath = "./data/foodmart_products.csv"
+    val categoriesPath = "./data/foodmart_categories.csv"
 
     val ss = SparkSession.builder().master("local").appName("TargetedPromotionSpark").getOrCreate()
     val sc = ss.sparkContext
@@ -111,30 +111,78 @@ object TargetedPromotionSpark {
     var clusterID = 0
     for (clusterID <- 0 to K - 1) {
 
-      val clusterTransactionsRDD = transactionsFPG.filter(r => r._1 == clusterID).flatMap(r => r._2)
+      val clusterTransactionsRDD = transactionsFPG.filter(r => r._1 == clusterID).flatMap(r => r._2).persist()
 
       val fpg = new FPGrowth()
-        .setMinSupport(0.1)
+        .setMinSupport(0.02)
         .setNumPartitions(10)
 
       val model = fpg.run(clusterTransactionsRDD)
-
-      model.freqItemsets.collect().foreach { itemset =>
-        var catItems = itemset.items.map(r => categoriesMap.get((r.toInt + 1).toString).get)
-        println(s"${catItems.mkString("[", ",", "]")},${itemset.freq}")
+      val itemsIndex = scala.collection.mutable.Set[Int]()
+      val itemsets = model.freqItemsets.collect()
+      itemsets.foreach { itemset =>
+        itemset.items.foreach(index => itemsIndex.add(index.toInt))
       }
 
-      model.generateAssociationRules(minConfidence).collect().foreach { rule =>
-        var anteCatItems = rule.antecedent.map(r => categoriesMap.get((r.toInt + 1).toString).get)
-        var conseCatItems = rule.consequent.map(r => categoriesMap.get((r.toInt + 1).toString).get)
+      val freqClusterTransactionsRDD = clusterTransactionsRDD.filter(transaction => {
+        transaction.map(r => r.toInt).toSet[Int].intersect(itemsIndex).size > 1
+      })
 
-        println(s"${anteCatItems.mkString("[", ",", "]")}=> " +
-          s"${conseCatItems.mkString("[", ",", "]")},${rule.confidence}")
+      val model2 = fpg.setMinSupport(0).run(freqClusterTransactionsRDD)
+      val rulesMap: collection.mutable.Map[String, Double] = collection.mutable.Map()
+
+      model2.generateAssociationRules(0).collect().foreach { rule =>
+        // TODO make key function
+        val ante = rule.antecedent.map(item => item.toInt).sorted.mkString(",")
+        val cons = rule.consequent.map(item => item.toInt).sorted.mkString(",")
+        val key = ante + "::" + cons
+
+        rulesMap.update(key, rule.confidence)
       }
 
-      println("END OF FPGROWTH")
-      println("cluster id = " + clusterID)
-      println("count = " + clusterTransactionsRDD.count())
+      itemsets.map(itemset => {
+        val items = itemset.items.map(item => item.toInt)
+
+        var allConf = 0.0
+        if (items.size > 1) {
+          val subsets = items.toSet[Int].subsets.map(_.toList).toList
+          allConf = 1
+          println("items => " + items.mkString(",") + " size::: " + items.size)
+          subsets.foreach(antecedent => {
+            val consequent = items.diff(antecedent)
+
+            if (antecedent.size > 0 && consequent.size > 0) {
+              val ante = antecedent.sorted.mkString(",")
+              val cons = consequent.sorted.mkString(",")
+              val key = ante + "::" + cons
+              val conf = rulesMap.get(key).get
+
+              println("conf = " + conf)
+
+              if (conf < allConf)
+                allConf = conf
+            }
+
+            println("allconf = " + allConf)
+          })
+        }
+
+        allConf
+      })
+
+      print("-----------------------------------")
+
+//      model.generateAssociationRules(minConfidence).collect().foreach { rule =>
+//        var anteCatItems = rule.antecedent.map(r => categoriesMap.get((r.toInt + 1).toString).get)
+//        var conseCatItems = rule.consequent.map(r => categoriesMap.get((r.toInt + 1).toString).get)
+//
+//        println(s"${anteCatItems.mkString("[", ",", "]")}=> " +
+//          s"${conseCatItems.mkString("[", ",", "]")},${rule.confidence}")
+//      }
+
+//      println("END OF FPGROWTH")
+//      println("cluster id = " + clusterID)
+//      println("count = " + clusterTransactionsRDD.count())
 
     }
 

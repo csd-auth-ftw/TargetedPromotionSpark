@@ -44,10 +44,6 @@ def create_parser():
     return parser
 
 def main():
-    '''
-    main
-    '''
-
     # parse cli args
     args = create_parser().parse_args()
 

@@ -21,8 +21,6 @@ libraryDependencies ++= Seq(
   "org.scalanlp" %% "breeze-viz" % "0.12"
   //"org.apache.spark" %% "spark-streaming" % sparkVersion,
   //"org.apache.spark" %% "spark-hive" % sparkVersion
-
-
 )
 
 resolvers ++= Seq(

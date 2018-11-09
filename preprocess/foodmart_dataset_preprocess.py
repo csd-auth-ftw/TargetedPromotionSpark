@@ -14,7 +14,7 @@ After that, use the resulting csv files as input for this script.
 
 # global constants
 VALID_CLASSES_COLUMNS = ['product_subcategory', 'product_category', 'product_department', 'product_family']
-PRODUCTS_OUT_HEADER = 'product_id,categories\n'
+PRODUCTS_OUT_HEADER = 'product_id,categories,SRP,wholesale_price,inventory_cost\n'
 CATEGORIES_OUT_HEADER = 'category_id,category_name\n'
 
 # default options
@@ -34,6 +34,29 @@ def diff(a, b):
 def keep_valid_columns(columns):
     return list(set(columns) & set(VALID_CLASSES_COLUMNS))
 
+def get_cost_data(sales_df, wprice_prct = 0.8):
+    cost_data_df = sales_df[['product_id', 'store_sales', 'store_cost', 'unit_sales']].copy()
+
+    # unit sales & expenses
+    cost_data_df['store_sales'] = cost_data_df['store_sales'] / cost_data_df['unit_sales']
+    cost_data_df['store_cost'] = cost_data_df['store_cost'] / cost_data_df['unit_sales']
+    cost_data_df = cost_data_df.drop(columns=['unit_sales'])
+
+    # compute aggregated stats about the columns
+    cost_data_df = cost_data_df.groupby('product_id', as_index=False).agg({
+        'store_sales': ['median'],
+        'store_cost': ['min', 'max', 'median']
+    }).sort_values(['product_id'])
+
+    # compute new cost fields. Some assumptions made about wholesale_price, inventory_cost
+    cost_data_df['SRP'] = cost_data_df['store_sales']['median']
+    cost_data_df['wholesale_price'] = cost_data_df['store_cost']['median'] * wprice_prct
+    cost_data_df['inventory_cost'] = cost_data_df['store_cost']['median'] - cost_data_df['wholesale_price']
+
+    cost_data_df = cost_data_df[['product_id', 'SRP', 'wholesale_price', 'inventory_cost']]
+    cost_data_df.columns = cost_data_df.columns.droplevel(-1)
+    return cost_data_df
+
 def create_parser():
     parser = argparse.ArgumentParser(
         description='FoodMart dataset preprocessing')
@@ -52,7 +75,11 @@ def create_parser():
 
     return parser
 
-def write_products(args, products_extended_df, categories, index_diff):
+def write_products(args, products_extended_df, cost_data_df, categories, index_diff):
+    # join the products with the related prices
+    products_extended_df = products_extended_df.merge(
+        cost_data_df, on='product_id').sort_values(['product_id']).round(2)
+
     with open(args.products_out, 'w+') as file:
         file.write(PRODUCTS_OUT_HEADER)
 
@@ -70,8 +97,8 @@ def write_products(args, products_extended_df, categories, index_diff):
             if args.skip_filtered and has_filtered:
                 product_row = []
 
-            file.write('{},{}\n'.format(
-                str(row.product_id), '-'.join(product_row)))
+            file.write('{},{},{},{},{}\n'.format(
+                str(row.product_id), '-'.join(product_row), row.SRP, row.wholesale_price, row.inventory_cost))
 
 def write_categories(args, categories, index_diff):
     with open(args.categories_out, 'w+') as file:
@@ -107,6 +134,7 @@ def main():
     # load input tables as dataframes
     classes_df = pd.read_csv(args.classes_in)
     products_df = pd.read_csv(args.products_in)
+    sales_df = pd.read_csv(args.sales_in)
 
     # create a list of unique categories
     categories = []
@@ -121,12 +149,11 @@ def main():
         classes_df, on='product_class_id').sort_values(['product_id'])[ext_mask]
 
     if args.filter != None or args.plot:
-        # load sales table and join with products
-        sales_df = pd.read_csv(args.sales_in)
-        sales_extended_df = sales_df.merge(products_extended_df, on='product_id')
+        # join sales with products
+        sales_products_df = sales_df.merge(products_extended_df, on='product_id')
 
         # group and count subcategory frequencies
-        subcategory_count_df = sales_extended_df[['product_subcategory', 'product_id']].groupby(
+        subcategory_count_df = sales_products_df[['product_subcategory', 'product_id']].groupby(
             'product_subcategory', as_index=False).count().sort_values(['product_id'])
 
         # filter subcategories with high frequencies
@@ -143,8 +170,11 @@ def main():
             subcategory_count_df.plot(kind='bar')
             plt.show()
 
+    # compute cost data from sales
+    cost_data_df = get_cost_data(sales_df)
+
     # save products x categories file
-    write_products(args, products_extended_df, categories, index_diff)
+    write_products(args, products_extended_df, cost_data_df, categories, index_diff)
 
     # save categories file
     write_categories(args, categories, index_diff)

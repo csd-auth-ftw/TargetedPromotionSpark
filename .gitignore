@@ -80,3 +80,4 @@ project/plugins/project/
 data/*
 preprocess/input/*
 preprocess/output/*
+.vscode/*

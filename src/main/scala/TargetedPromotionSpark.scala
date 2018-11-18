@@ -7,7 +7,15 @@ object TargetedPromotionSpark {
 
   val LOG_LEVEL = "ERROR"
   val NUMBER_ITERATIONS: Int = 50
+  var TOP_K_ITEMSETS: Int = 8
   val K = 4
+
+  def itemsetToSparseVector(itemset: FPGrowth.FreqItemset[String], size: Int): SparseVector = {
+    val indices = itemset.items.map(r => r.toInt - 1).sorted
+    val values = Array.fill(indices.length)(1.toDouble)
+
+    new SparseVector(size, indices, values)
+  }
 
   def main(args: Array[String]): Unit = {
 
@@ -42,10 +50,10 @@ object TargetedPromotionSpark {
       .map(
         r =>
           (r.getString(0),
-           (r.getString(1),
-            r.getString(2).toDouble,
-            r.getString(3).toDouble,
-            r.getString(4).toDouble)))
+            (r.getString(1),
+              r.getString(2).toDouble,
+              r.getString(3).toDouble,
+              r.getString(4).toDouble)))
       .toMap
     val bcategoriesSize = ss.sparkContext.broadcast(categoriesMap.size)
     val bproductMap = sc.broadcast(productsMap)
@@ -55,7 +63,7 @@ object TargetedPromotionSpark {
       .map(
         r =>
           (r.getString(1) + ":" + r.getString(2),
-           r.getString(0) + "-" + r.getString(3)))
+            r.getString(0) + "-" + r.getString(3)))
       .rdd
       .map(x => {
         var tokens = x._2.split("-")
@@ -63,6 +71,7 @@ object TargetedPromotionSpark {
       })
       .reduceByKey((acc, y) => acc ++ y)
 
+    // (T,f(i))
     val transactionUnitRDD = raw_transactionsRDD
       .map(r => {
 
@@ -81,16 +90,17 @@ object TargetedPromotionSpark {
           .sortBy(_._1)
 
         (r._1,
-         new SparseVector(bcategoriesSize.value,
-                          categoriesSales.map(_._1),
-                          categoriesSales.map(_._2)))
+          new SparseVector(bcategoriesSize.value,
+            categoriesSales.map(_._1),
+            categoriesSales.map(_._2)))
       })
       .persist()
+
 
     val transactionsRDD = transactionUnitRDD.map(
       transaction =>
         (transaction._1,
-         new SparseVector(transaction._2.size, transaction._2.indices, Array.fill(transaction._2.indices.length)(1.toDouble))))
+          new SparseVector(transaction._2.size, transaction._2.indices, Array.fill(transaction._2.indices.length)(1.toDouble))))
 
     var bcenters = sc.broadcast(
       transactionsRDD
@@ -122,6 +132,8 @@ object TargetedPromotionSpark {
 
     bcenters.destroy()
     bcenters = sc.broadcast(centersInfo)
+
+    var allFreqItemset = new Array[Array[FPGrowth.FreqItemset[String]]](K)
 
     //TODO
     var i = 0
@@ -237,12 +249,34 @@ object TargetedPromotionSpark {
           }
           (itemset, allConf)
         })
-        .sortBy(-_._2)
         .filter(_._1.items.length > 1)
-        .take(8)
+        .sortBy(-_._2)
+        .take(TOP_K_ITEMSETS)
 
+      allFreqItemset(clusterID) = allConfItemset.map(_._1)
     }
 
+    val includedCategories = allFreqItemset.flatten.map(r => itemsetToSparseVector(r, categoriesMap.size)).reduce((acc, y) => {
+      val accSet = acc.indices.toSet
+      val ySet = y.indices.toSet
+      val indices = accSet.union(ySet).toArray.sorted
+
+      new SparseVector(acc.size, indices, Array.fill(indices.length)(1.toDouble))
+    })
+
+    val bIncludedCategories = sc.broadcast(includedCategories.indices.toSet)
+
+
+    val count = transactionUnitRDD.filter(transaction => {
+      val indices = transaction._2.indices.toSet
+
+      bIncludedCategories.value.intersect(indices).size > 1
+    }).count()
+
+    println(transactionUnitRDD.count())
+    println(count)
+
   }
+
 
 }

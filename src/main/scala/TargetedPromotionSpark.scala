@@ -3,6 +3,8 @@ import org.apache.spark.mllib.fpm.FPGrowth
 import org.apache.spark.mllib.fpm.FPGrowth.FreqItemset
 import org.apache.spark.sql.SparkSession
 
+import scala.collection.mutable.ListBuffer
+
 object TargetedPromotionSpark {
 
   val LOG_LEVEL = "ERROR"
@@ -10,11 +12,20 @@ object TargetedPromotionSpark {
   var TOP_K_ITEMSETS: Int = 8
   val K = 4
 
-  def itemsetToSparseVector(itemset: FPGrowth.FreqItemset[String], size: Int): SparseVector = {
+  def itemsetToSparseVector(itemset: FPGrowth.FreqItemset[String],
+                            size: Int): SparseVector = {
     val indices = itemset.items.map(r => r.toInt - 1).sorted
     val values = Array.fill(indices.length)(1.toDouble)
 
     new SparseVector(size, indices, values)
+  }
+
+  //TODO check itemset -1
+  def isItemsetSubset(transaction: SparseVector,
+                      itemset: FreqItemset[String]) = {
+    val ids = itemset.items.map(_.toInt - 1).toSet
+
+    transaction.indices.toSet.intersect(ids).size == ids.size
   }
 
   def main(args: Array[String]): Unit = {
@@ -50,10 +61,10 @@ object TargetedPromotionSpark {
       .map(
         r =>
           (r.getString(0),
-            (r.getString(1),
-              r.getString(2).toDouble,
-              r.getString(3).toDouble,
-              r.getString(4).toDouble)))
+           (r.getString(1),
+            r.getString(2).toDouble,
+            r.getString(3).toDouble,
+            r.getString(4).toDouble)))
       .toMap
     val bcategoriesSize = ss.sparkContext.broadcast(categoriesMap.size)
     val bproductMap = sc.broadcast(productsMap)
@@ -63,7 +74,7 @@ object TargetedPromotionSpark {
       .map(
         r =>
           (r.getString(1) + ":" + r.getString(2),
-            r.getString(0) + "-" + r.getString(3)))
+           r.getString(0) + "-" + r.getString(3)))
       .rdd
       .map(x => {
         var tokens = x._2.split("-")
@@ -71,16 +82,14 @@ object TargetedPromotionSpark {
       })
       .reduceByKey((acc, y) => acc ++ y)
 
-    // (T,f(i))
+    // (T,((f(i), Profit(T)))
     val transactionUnitRDD = raw_transactionsRDD
       .map(r => {
-
         var categoriesSales = r._2
           .flatMap(
             s =>
-              bproductMap.value
-                .get(s._1.toString)
-                .get
+              bproductMap
+                .value(s._1.toString)
                 ._1
                 .split("-")
                 .map(id => (id.toInt, s._2.toDouble)))
@@ -89,18 +98,30 @@ object TargetedPromotionSpark {
           .toArray
           .sortBy(_._1)
 
+        // profit T computation
+        val profitMargin = r._2
+          .map(product => {
+            val productInfo = productsMap(product._1.toString)
+
+            (productInfo._2 - productInfo._3) * product._2
+          }).sum
+
+
         (r._1,
-          new SparseVector(bcategoriesSize.value,
-            categoriesSales.map(_._1),
-            categoriesSales.map(_._2)))
+         (new SparseVector(bcategoriesSize.value,
+                           categoriesSales.map(_._1),
+                           categoriesSales.map(_._2)),
+          profitMargin))
       })
       .persist()
-
 
     val transactionsRDD = transactionUnitRDD.map(
       transaction =>
         (transaction._1,
-          new SparseVector(transaction._2.size, transaction._2.indices, Array.fill(transaction._2.indices.length)(1.toDouble))))
+         new SparseVector(
+           transaction._2._1.size,
+           transaction._2._1.indices,
+           Array.fill(transaction._2._1.indices.length)(1.toDouble))))
 
     var bcenters = sc.broadcast(
       transactionsRDD
@@ -256,27 +277,68 @@ object TargetedPromotionSpark {
       allFreqItemset(clusterID) = allConfItemset.map(_._1)
     }
 
-    val includedCategories = allFreqItemset.flatten.map(r => itemsetToSparseVector(r, categoriesMap.size)).reduce((acc, y) => {
-      val accSet = acc.indices.toSet
-      val ySet = y.indices.toSet
-      val indices = accSet.union(ySet).toArray.sorted
+    val bAllFreqItemset = sc.broadcast(allFreqItemset)
 
-      new SparseVector(acc.size, indices, Array.fill(indices.length)(1.toDouble))
-    })
+    val includedCategories = allFreqItemset.flatten
+      .map(r => itemsetToSparseVector(r, categoriesMap.size))
+      .reduce((acc, y) => {
+        val accSet = acc.indices.toSet
+        val ySet = y.indices.toSet
+        val indices = accSet.union(ySet).toArray.sorted
+
+        new SparseVector(acc.size,
+                         indices,
+                         Array.fill(indices.length)(1.toDouble))
+      })
 
     val bIncludedCategories = sc.broadcast(includedCategories.indices.toSet)
 
+    //V(a) computation
+    val grossSalesMargin = transactionUnitRDD
+      .filter(transaction => {
+        val indices = transaction._2._1.indices.toSet
 
-    val count = transactionUnitRDD.filter(transaction => {
-      val indices = transaction._2.indices.toSet
+        bIncludedCategories.value.intersect(indices).size > 1
+      })
+      .map(transaction => {
 
-      bIncludedCategories.value.intersect(indices).size > 1
-    }).count()
+        val freqItemsetSizes = bAllFreqItemset.value.map(_.length)
+        val partialVA =
+          Array.fill(bAllFreqItemset.value.flatten.length)(0.toDouble)
 
-    println(transactionUnitRDD.count())
-    println(count)
+        var clusterID = 0
+        for (clusterID <- 0 until K) {
+          var clusterFreqItemsets = bAllFreqItemset.value(clusterID)
+
+          var itemsetList =
+            new ListBuffer[(FPGrowth.FreqItemset[String], Int)]()
+          var freqSum = 0.0
+          for (i <- clusterFreqItemsets.indices) {
+            if (isItemsetSubset(transaction._2._1, clusterFreqItemsets(i))) {
+              freqSum += clusterFreqItemsets(i).freq
+              itemsetList += ((clusterFreqItemsets(i), i))
+
+            }
+
+          }
+
+          //weight computation
+          for (values <- itemsetList) {
+            var index = freqItemsetSizes.slice(0, clusterID).sum + values._2
+            partialVA(index) = values._1.freq / freqSum * transaction._2._2
+
+          }
+
+        }
+
+        partialVA
+
+      }).reduce( (acc, pva) => acc.zip(pva).map { case (x, y) => x + y } )
+
+    x1 + 23 +
+
+    grossSalesMargin.foreach(println)
 
   }
-
 
 }
